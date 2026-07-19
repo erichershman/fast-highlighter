@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Highlight.js
+// @name         Fast Highlighter
 // @namespace    http://tampermonkey.net/
-// @version      1.0
+// @version      1.1
 // @description  Instant keyword highlighting using the CSS Custom Highlight API, with a safe reversible DOM fallback
 // @author       Eric Hershman
 // @match        *://*/*
@@ -28,6 +28,10 @@
     const UI_ATTR = 'data-dfh-ui'; // roots of our own UI (popup/dialogs)
     const COLOR_RE = /^#[0-9a-f]{6}$/i;
     const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEXTAREA', 'INPUT', 'SELECT', 'IFRAME']);
+    // Treats text across these tags as single strings for matching across spans. 
+    const INLINE_TAGS = new Set(['A', 'ABBR', 'B', 'BDI', 'BDO', 'CITE', 'CODE', 'DATA', 'DEL', 'DFN',
+        'EM', 'FONT', 'I', 'INS', 'KBD', 'MARK', 'Q', 'RB', 'RP', 'RT', 'RUBY', 'S', 'SAMP', 'SMALL',
+        'SPAN', 'STRIKE', 'STRONG', 'SUB', 'SUP', 'TIME', 'TT', 'U', 'VAR', 'WBR']);
     const hasHighlightAPI = typeof CSS !== 'undefined' && CSS.highlights && typeof Highlight === 'function';
     const hasGM = typeof GM_getValue === 'function' && typeof GM_setValue === 'function';
 
@@ -260,6 +264,45 @@
         while ((n = walker.nextNode())) yield n;
     }
 
+    // Merges adjacent text nodes so words split by HTML tags (like "Java<b>script</b>") still matches.
+    
+    function* textRuns(root) {
+        const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
+            acceptNode(node) {
+                if (node.nodeType === Node.ELEMENT_NODE) {
+                    return (SKIP_TAGS.has(node.tagName) || node.hasAttribute(UI_ATTR) || node.isContentEditable) ?
+                        NodeFilter.FILTER_REJECT :
+                        NodeFilter.FILTER_ACCEPT; // element visits mark run boundaries
+                }
+                return NodeFilter.FILTER_ACCEPT; // keep spaces to prevent adjacent word merges
+            }
+        });
+        let run = [];
+        let ctx = null; // nearest block
+        let n;
+        while ((n = walker.nextNode())) {
+            if (n.nodeType === Node.ELEMENT_NODE) {
+                // Entering a block element ends the run even if the block is empty.
+                if (!INLINE_TAGS.has(n.tagName) && run.length) {
+                    yield run;
+                    run = [];
+                    ctx = null;
+                }
+                continue;
+            }
+            let el = n.parentElement;
+            while (el && el !== root && INLINE_TAGS.has(el.tagName)) el = el.parentElement;
+            if (ctx !== null && el !== ctx && run.length) {
+                // Leaving a block element ends the run.
+                yield run;
+                run = [];
+            }
+            ctx = el;
+            run.push(n);
+        }
+        if (run.length) yield run;
+    }
+
     // Parse Hex Color and choose black or white text.
     function textColor(hex) {
         const r = parseInt(hex.slice(1, 3), 16);
@@ -319,11 +362,36 @@
         }
     }
 
+    // Finds keywords in the merged text, then maps the exact start/end points back to the real DOM nodes (even if the word spans multiple nodes).
+
+    function highlightRun(run) {
+        const text = run.length === 1 ? run[0].data : run.map(n => n.data).join('');
+        if (!/\S/.test(text)) return;
+        const matches = collectMatches(text);
+        if (!matches.length) return;
+        const starts = new Array(run.length);
+        let pos = 0;
+        for (let i = 0; i < run.length; i++) {
+            starts[i] = pos;
+            pos += run[i].data.length;
+        }
+        let i = 0; // matches are sorted, so we only need to scan forward
+        for (const m of matches) {
+            while (i + 1 < run.length && starts[i + 1] <= m.start) i++;
+            let j = i;
+            while (j + 1 < run.length && starts[j + 1] < m.end) j++;
+            const r = new Range();
+            r.setStart(run[i], m.start - starts[i]);
+            r.setEnd(run[j], m.end - starts[j]);
+            ensureHighlight(m.list).add(r);
+        }
+    }
+
     function scanAdded(node) {
         if (node.nodeType === Node.TEXT_NODE) {
             if (/\S/.test(node.data) && isHighlightable(node.parentElement)) highlightTextNode(node);
         } else if (node.nodeType === Node.ELEMENT_NODE && isHighlightable(node)) {
-            for (const t of textNodes(node)) highlightTextNode(t);
+            for (const run of textRuns(node)) highlightRun(run);
         }
     }
 
@@ -370,21 +438,7 @@
         if (hasHighlightAPI) {
             clearHighlights();
             if (!highlightsEnabled || !matcher) return;
-            const ranges = lists.map(() => []);
-            for (const node of textNodes(document.body)) {
-                for (const m of collectMatches(node.data)) {
-                    const r = new Range();
-                    r.setStart(node, m.start);
-                    r.setEnd(node, m.end);
-                    ranges[m.list].push(r);
-                }
-            }
-            ranges.forEach((rs, i) => {
-                if (!rs.length) return;
-                const hl = new Highlight();
-                for (const r of rs) hl.add(r);
-                CSS.highlights.set(HL_PREFIX + i, hl);
-            });
+            for (const run of textRuns(document.body)) highlightRun(run);
         } else {
             // Pause the observer around our own writes or it triggers indefinitely.
             withObserverPaused(() => {
@@ -414,11 +468,16 @@
         characterData: true
     };
     let observer = null;
-    let debounceTimer = 0;
+    let rebuildScheduled = false;
 
+    // Syncs updates to the next frame. Prevents constant DOM changes from freezing the rebuild (live search box support)
     function scheduleRebuild() {
-        clearTimeout(debounceTimer);
-        debounceTimer = setTimeout(highlightPage, 150);
+        if (rebuildScheduled) return;
+        rebuildScheduled = true;
+        requestAnimationFrame(() => {
+            rebuildScheduled = false;
+            highlightPage();
+        });
     }
 
     function isOwnUI(node) {
